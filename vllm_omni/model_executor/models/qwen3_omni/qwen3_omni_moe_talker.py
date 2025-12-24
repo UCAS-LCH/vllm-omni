@@ -233,8 +233,12 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
                         TopPLogitsWarper(top_p=top_p),
                     ]
                 )
-                input_ids_for_logits_processors = torch.tensor([pos_codes[1:]]).to(logits.device, dtype=torch.long)
-                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(0)).unsqueeze(0)
+                if len(pos_codes) > 1:
+                    pos_codes_slice = torch.stack(pos_codes[1:], dim=1)
+                    input_ids_for_logits_processors = pos_codes_slice.to(logits.device, dtype=torch.long).squeeze(-1)
+                else:
+                    input_ids_for_logits_processors = torch.tensor([pos_codes[1:]]).to(logits.device, dtype=torch.long)
+                logits = logits_processors(input_ids_for_logits_processors, logits.squeeze(1)).unsqueeze(1)
 
                 # Sample from the filtered distribution
                 probs = F.softmax(logits, dim=-1)
@@ -384,9 +388,15 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         batched_positions = []
         batched_input_embeds = []
         batched_code_predictor_codes = []
+        # for batched code predictor inputs
+        batched_code_predictor_input_ids = []
+        batched_code_predictor_input_embeds = []
+        batched_text_step = []
+        batched_last_talker_hidden = []
+        decode_req_index = []
         if intermediate_tensors is not None:
             inputs_embeds = None
-        for rid in batched_talker_inputs:
+        for idx, rid in enumerate(batched_talker_inputs):
             input_ids = safe_tensor_reshape(batched_talker_inputs[rid]["input_ids"], (1, -1))
             positions = batched_talker_inputs[rid]["positions"]
             inputs_embeds = safe_tensor_reshape(
@@ -399,17 +409,35 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             # for profiling
             if inputs_embeds.shape[-1] == 2048:
                 inputs_embeds = self.text_projection(inputs_embeds)
+            # for batch code predictor, collect input
             if inputs_embeds.shape[0] == 1:
-                code_predictor_codes, summed_embeddings = self.code_predictor_forward(
-                    input_ids, inputs_embeds.clone(), last_talker_hidden=last_talker_hidden
-                )
-                inputs_embeds = summed_embeddings.clone()
-            else:
-                code_predictor_codes = torch.zeros((0, self.num_code_groups), dtype=torch.long)
+                batched_code_predictor_input_ids.append(input_ids)
+                batched_code_predictor_input_embeds.append(inputs_embeds)
+                batched_last_talker_hidden.append(last_talker_hidden)
+                batched_text_step.append(text_step)
+                decode_req_index.append(idx)
+
+            code_predictor_codes = torch.zeros((0, self.num_code_groups), dtype=torch.long)
             batched_input_ids.append(input_ids.reshape(-1))
             batched_positions.append(positions)
             batched_input_embeds.append((inputs_embeds + text_step).reshape(-1, self.config.text_config.hidden_size))
             batched_code_predictor_codes.append(code_predictor_codes.squeeze(-1).detach().to("cpu").contiguous())
+
+        if decode_req_index:
+            decode_text_step = torch.cat(batched_text_step, dim=0)
+            code_predictor_input_ids = torch.cat(batched_code_predictor_input_ids, dim=0)
+            code_predictor_input_embeds = torch.cat(batched_code_predictor_input_embeds, dim=0)
+            last_talker_hidden = torch.cat(batched_last_talker_hidden, dim=0)
+            code_predictor_codes, summed_embeddings = self.code_predictor_forward(
+                code_predictor_input_ids, code_predictor_input_embeds, last_talker_hidden=last_talker_hidden
+            )
+            decode_embeds = (summed_embeddings.clone() + decode_text_step).reshape(-1, self.config.text_config.hidden_size)
+            code_predictor_codes = code_predictor_codes.squeeze(-1).detach().to("cpu").contiguous()
+            # Distributed to the corresponding locations of each decode request
+            for i, idx in enumerate(decode_req_index):
+                batched_code_predictor_codes[idx] = code_predictor_codes[i:i+1]
+                batched_input_embeds[idx] = decode_embeds[i:i+1]
+
         try:
             talker_input_ids = torch.cat(batched_input_ids, dim=0)
             talker_positions = torch.cat(batched_positions, dim=0)
@@ -420,6 +448,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             print(f"talker_input_ids shape: {[tensor.shape for tensor in batched_input_ids]}")
             print(f"talker_positions shape: {[tensor.shape for tensor in batched_positions]}")
             raise e
+
         talker_hidden_states, _ = self.language_model.model(
             talker_input_ids,
             talker_positions,
